@@ -1,0 +1,132 @@
+---
+- name: Kubernetes Cluster Setup
+  hosts: k8s
+  become: yes
+  vars:
+    kube_version: "1.28.0"
+    container_runtime: "containerd"
+
+  tasks:
+    - name: Install dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        update_cache: yes
+
+    - name: Add Docker GPG key
+      shell: |
+        mkdir -p /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+
+    - name: Add Docker repo
+      shell: |
+        echo \
+        "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+        https://download.docker.com/linux/ubuntu \
+        $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+    - name: Install containerd
+      apt:
+        name: containerd.io
+        update_cache: yes
+
+    - name: Configure containerd and restart
+      shell: |
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+        systemctl restart containerd
+        systemctl enable containerd
+
+    - name: Disable swap
+      shell: |
+        swapoff -a
+        sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+    - name: Load kernel modules
+      shell: |
+        modprobe overlay
+        modprobe br_netfilter
+
+    - name: Set sysctl params
+      copy:
+        dest: /etc/sysctl.d/kubernetes.conf
+        content: |
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.ipv4.ip_forward = 1
+
+    - name: Apply sysctl settings
+      shell: sysctl --system
+
+    - name: Add Kubernetes GPG key
+      shell: |
+        curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+
+    - name: Add Kubernetes repo
+      apt_repository:
+        repo: deb http://apt.kubernetes.io/ kubernetes-xenial main
+
+    - name: Install Kubernetes components
+      apt:
+        name:
+          - kubeadm={{ kube_version }}
+          - kubelet={{ kube_version }}
+          - kubectl={{ kube_version }}
+        state: present
+        update_cache: yes
+
+    - name: Hold Kubernetes packages
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        allow_unauthenticated: yes
+        autoremove: no
+        force: yes
+        lock: yes
+
+- name: Initialize Kubernetes Master
+  hosts: master
+  become: yes
+  tasks:
+    - name: Initialize cluster
+      command: kubeadm init --pod-network-cidr=192.168.0.0/16
+      register: kubeadm_init
+
+    - name: Save join command
+      shell: |
+        kubeadm token create --print-join-command
+      register: join_command
+      changed_when: false
+
+    - name: Copy join command to file
+      copy:
+        dest: /tmp/join-command.sh
+        content: "{{ join_command.stdout }}"
+        mode: '0755'
+
+    - name: Set up kubeconfig for ubuntu user
+      become_user: ubuntu
+      shell: |
+        mkdir -p $HOME/.kube
+        sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+        sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+- name: Join worker nodes
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Copy join command from master
+      fetch:
+        src: /tmp/join-command.sh
+        dest: /tmp/join-command.sh
+        flat: yes
+
+    - name: Join the Kubernetes cluster
+      command: sh /tmp/join-command.sh
